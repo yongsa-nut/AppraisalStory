@@ -1,0 +1,862 @@
+---
+title: "LLM_frameword_evaluation"
+author: "anonymous"
+date: "2024-10-02"
+output: html_document
+---
+
+## Setup space
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages
+```{r library, echo=FALSE}
+library(tidyverse)
+```
+
+Help function for loading data
+```{r help function}
+
+manipulate_data <- function(data_to_clean, social_special = FALSE, reversed = FALSE){ # takes in dataframe and whether it's a social or reversed scenario that needs different cleaning
+  
+  emotion_order = c("Interest", "Amusement", "Pride", "Joy", "Pleasure", # all emotion names in order
+      "Contentment", "Love", "Admiration", "Relief", "Compassion",
+      "Sadness", "Guilt", "Regret", "Shame", "Disappointment",
+      "Fear", "Disgust", "Contempt", "Hate", "Anger")
+  
+  names_for_delim = emotion_order # cope for ease 
+  
+    if (reversed == TRUE){ # if prompt is reversed we reverse emotion order
+      names_for_delim = rev(names_for_delim)
+    }
+    
+    data_clean <- data_to_clean %>%
+      mutate_all(as.factor) %>%
+      mutate(response_raw = as.character(response)) %>% # translate back to charater
+      rowwise() %>%
+      mutate(  
+             response = str_split(response_raw, "<")[[1]][2], # all answers start with answer. We split off anything before (as some answers have text and numbers prior to the actual responses) it returns a nested list [[1]] to get list and [2] to access everything after <answer>
+             response = gsub("[^0-9,]", "", response),
+             resp_length = str_length(response), # sanity checking
+             resp_raw_length = str_length(response_raw)) %>% # sanity checking 
+      separate_wider_delim(response, delim = ",", names = names_for_delim, too_few = "align_start", cols_remove = FALSE) %>% # split intensity ratings by commas into different columns and use emotion names as column names.
+      mutate_if(colnames(.) %in% emotion_order, as.integer) %>% # change ratings to int
+      select(model, domain, prompt, temperature, n, all_of(emotion_order), everything()) # clean up.
+
+    if (social_special == TRUE){
+      data_clean <- data_clean %>%
+        mutate(`char2:relationship` = "NA") # manage special case for social
+    }
+    
+    return(data_clean)
+}
+
+```
+
+##Load data
+First we load LLM data
+```{r load files}
+files_path <- "./data/"
+
+# define for global environment
+emotion_order = c("Interest", "Amusement", "Pride", "Joy", "Pleasure",
+      "Contentment", "Love", "Admiration", "Relief", "Compassion",
+      "Sadness", "Guilt", "Regret", "Shame", "Disappointment",
+      "Fear", "Disgust", "Contempt", "Hate", "Anger")
+
+# read all files but social1 and write to new csv
+data_normal_order <- read_csv(paste(files_path, "data_normal_order.csv", sep = "")) %>%
+  manipulate_data()
+data_reversed_order <- read_csv(paste(files_path, "data_reversed_order.csv", sep = "")) %>%
+  manipulate_data(reversed = TRUE)
+
+# read social1 and write to new csv
+data_normal_order_social1 <- read_csv(paste(files_path, "data_normal_order_social1.csv", sep = "")) %>%
+  manipulate_data(social_special = TRUE)
+data_reversed_order_social1 <- read_csv(paste(files_path, "data_reversed_order_social1.csv", sep = "")) %>%
+  manipulate_data(social_special = TRUE, reversed = TRUE)
+
+# bind all data with rows
+data_all_wide <- bind_rows(data_normal_order, data_normal_order_social1, data_reversed_order, data_reversed_order_social1)
+
+# pivot longer
+data_all <- data_all_wide %>%
+  pivot_longer(cols = all_of(emotion_order), names_to = "emotion", values_to = "rating") %>%
+  mutate(emotion = as.factor(emotion),
+         `event:outcome` = as.factor(case_match(`event:progress`, # create help columns for filtering
+                                      "early-above-exp" ~ "good",
+                                      "early-below-exp" ~ "bad",
+                                      "finish-done" ~ "good",
+                                      "finish-not-done" ~ "bad")),
+         `event:done` = as.factor(case_match(`event:progress`,
+                                      "early-above-exp" ~ "not finished",
+                                      "early-below-exp" ~ "not finished",
+                                      "finish-done" ~ "finished",
+                                      "finish-not-done" ~ "finished"))) %>%
+  select(model, domain, prompt, emotion, rating, temperature, n, everything())
+  
+# clean up
+rm(list = c("data_normal_order", "data_normal_order_social1", "data_reversed_order", "data_reversed_order_social1")) 
+```
+Load human data and bind it to LLM data.
+```{r bind human and LLM}
+
+# human data pre cleaned
+human_file_names <- c("./data/study1_wrangled.csv", "./data/study2_wrangled.csv")
+
+#prep human data for binding
+d_human <- do.call(rbind, lapply(human_file_names, read_csv)) %>% # load and bind studies into one df
+  mutate(ID = as.factor(ID)) %>%
+  mutate_if(is.character, as.factor)
+
+# prep llm data for binding
+d_llm_for_bind <- data_all %>%
+  mutate(outcomeXexpect = as.factor(paste(`char1:expectation`, `event:outcome`, sep = "_")),
+         outcomeXexpect = case_match(outcomeXexpect,
+                                     "high_bad" ~ "BH",
+                                     "high_good" ~ "GH",
+                                     "low_bad" ~ "BL",
+                                     "low_good" ~ "GL")) %>%
+  filter(temperature == "1",
+         `char2:aware` == "not-aware",
+         `event:done` == "finished",
+         prompt == "base") %>%
+  mutate(ID = as.factor(as.numeric(as.factor(paste(model, story, sep = ""))) + 500)) %>% # as each model is only run n times per story we can make each models' n runs one factor by making a new column which is the model name and the story together (if we only did it per story all models would get the same ID per story)
+  select(ID, model, domain, emotion, n, rating, outcomeXexpect, `char1:expectation`, `event:outcome`, story)
+  
+# bind data
+d_human_llm <- bind_rows(d_human, d_llm_for_bind) %>%
+  mutate(model = case_match(model, # rename model names for ease
+                                "Human" ~ "Human",
+                                "claude-3-5-sonnet-20240620" ~ "claude-sonnet",
+                                "google/gemini-pro-1.5" ~ "gemini-pro",
+                                "gpt-4o" ~ "gpt-4o",
+                                "meta-llama/llama-3.1-405b-instruct" ~ "llama"))
+
+# create overall summary
+d_human_llm_summary <- d_human_llm %>%
+group_by(model, domain, emotion, outcomeXexpect) %>% # group by relevant factors
+  summarise(n = n(), 
+            mean_value = mean(rating),
+            sd = sd(rating),
+            se = sd/sqrt(n),
+            error_bar_low = mean_value - se,
+            error_bar_high = mean_value + se) %>%
+  ungroup()
+```
+
+## Main plot
+We create main result plots.  These have the expectation x outcome interaction mean intensity ratings per model and human responses as well.
+
+```{r facet plots for direct comparison of domains} 
+
+# help for plotting
+level_order = c("Interest", "Amusement", "Pride", "Joy", "Pleasure",
+    "Contentment", "Love", "Admiration", "Relief", "Compassion",
+    "Sadness", "Guilt", "Regret", "Shame", "Disappointment",
+    "Fear", "Disgust", "Contempt", "Hate", "Anger") 
+
+# Choose relevant domain (uncomment for different domain)
+
+# domain_tmp = "basketball"
+# domain_tmp = "exam"
+# domain_tmp = "pottery"
+# domain_tmp = "project"
+# domain_tmp = "social1"
+domain_tmp = "social2"
+
+d_facet_plot <- d_human_llm %>% # filter to get specific domain 
+  filter(domain == domain_tmp,
+         model != "Human" # remove human data
+         ) %>%
+    group_by(model, emotion, outcomeXexpect) %>% # get data summary
+  summarise(count = n(),
+            mean_value = mean(rating),
+            sd = sd(rating),
+            se = sd/sqrt(count),
+            error_bar_low = mean_value - se,
+            error_bar_high = mean_value + se) %>%
+  ungroup()
+
+p <- d_facet_plot %>% # create facet_plot
+ggplot(data =., 
+       aes(x = emotion, y = mean_value, fill = outcomeXexpect)) +
+  geom_bar(stat = "identity", position = position_dodge()) + # create bar plot with each fill level next to each other
+  geom_errorbar( # add error bar (SE)
+    aes(ymin = mean_value - se, ymax = mean_value + se),
+    position = position_dodge(width = 0.9),
+    width = 0.25,
+    color = "black"
+  ) +
+  facet_wrap(~model) + # wrap with model
+  theme_minimal() + # edit theme
+  theme(text = element_text(size =16),
+         legend.text = element_text(size=16),
+    axis.text.x = element_text(angle = 45, hjust =1, size = 16)) +
+  theme(axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(colour = rep(c("#008837", "#7B3294"), each= 10)),
+        legend.position = "none",
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=1)) +
+  ylim(c(0,6.5)) + 
+  labs(title = "", x = "", y = "", fill = "Expectation x Outcome") + 
+  scale_x_discrete(limits = level_order) +
+  scale_fill_manual(values = c("#7B3294", "#C2A5CF", "#008837","#A6DBA0"))
+
+p %>% show()
+```
+
+```{r data for direct comparison - human only} 
+
+# filter to only get human data of domain temp from above
+d_facet_plot <- d_human_llm %>%
+  filter(domain == domain_tmp,
+         model == "Human"
+         ) %>%
+    group_by(model, emotion, outcomeXexpect) %>% # summarize and get main values of interest
+  summarise(count = n(),
+            mean_value = mean(rating),
+            sd = sd(rating),
+            se = sd/sqrt(count),
+            error_bar_low = mean_value - se,
+            error_bar_high = mean_value + se) %>%
+  ungroup()
+
+p <- d_facet_plot %>% # create plot similar to above
+ggplot(data =., 
+       aes(x = emotion, y = mean_value, fill = outcomeXexpect)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_errorbar(
+    aes(ymin = mean_value - se, ymax = mean_value + se),
+    position = position_dodge(width = 0.9),
+    width = 0.25,
+    color = "black"
+  ) + # themes
+  theme_minimal() +
+  theme(text = element_text(size =16),
+         legend.text = element_text(size=16),
+    axis.text.x = element_text(angle = 45, hjust =1, size = 16)) +
+  theme(axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(colour = rep(c("#008837", "#7B3294"), each= 10)),
+        panel.border = element_rect(colour = "black", fill=NA, linewidth=1)) +
+  ylim(c(0,6.5)) + 
+  labs(title = paste("Mean emotion rating across vignettes (", domain_tmp, ")", sep = ""), x = "", y = "", fill = "Expectation x Outcome") + 
+  scale_x_discrete(limits = level_order) +
+  scale_fill_manual(values = c("#7B3294", "#C2A5CF", "#008837","#A6DBA0"), labels = (c("Bad x High", "Bad x Low", "Good x High", "Good x Low")))
+
+p %>% show()
+
+```
+
+## Densities
+We create plot for the densities of each model + humans.  This is to check the mean rating distributions (i.e. check for normality).
+```{r Densities}
+
+# we create all plots in one loop
+# all domains
+list_domains <- c("basketball", "exam", "pottery", "project", "social1", "social2")
+
+for (domain_tmp in list_domains){ # for each domain
+
+p <- d_human_llm_summary %>% # use the summary data
+  filter(domain == domain_tmp) %>% # filter for relevant domain
+  ggplot(data = .,
+         aes(x = mean_value, color = model, fill = model)) +
+  facet_wrap(~model) + # wrap with 
+  geom_density(alpha = 0.2) + # create density
+  theme_bw() + # make theme edits
+  xlab("Mean values") + 
+  ylab("Density") + 
+  scale_color_viridis_d() +  # use colorblind friendly theme
+  scale_fill_viridis_d() +
+  labs(title = paste("Means of ratings across emotions and scenarios (", domain_tmp,")", sep = "")) +
+  theme(legend.position = "none")
+
+p %>% show()
+}
+```
+
+## Correlations
+Now we want to check correlations between and within models and create plots.
+
+
+### Within domains across between model
+```{r correlations for each domain across model}
+
+# plotting help
+list_order_names<- c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs gpt-4o", "Human vs llama", 
+                     "claude-sonnet vs gemini-pro", "claude-sonnet vs gpt-4o", "claude-sonnet vs llama", 
+                     "gemini-pro vs gpt-4o", "gemini-pro vs llama", "gpt-4o vs llama")
+
+list_order_limits <- c("claude-sonnet vs Human", "gemini-pro vs Human", "gpt-4o vs Human", "Human vs llama",
+                       "claude-sonnet vs gemini-pro", "claude-sonnet vs gpt-4o", "claude-sonnet vs llama", 
+                       "gemini-pro vs gpt-4o",  "gemini-pro vs llama", "gpt-4o vs llama")
+
+list_domains <- c("basketball", "exam", "pottery", "project", "social1", "social2")
+
+# We do calculations and plotting within the same loop
+for (domain_tmp in list_domains){ # for each domain
+
+# filter for the right domain
+data_correlations_plot <- d_human_llm_summary %>% # get relevant domain
+  filter(domain == domain_tmp,) %>% 
+  ungroup()
+
+
+# calculate correlations
+cor_data_prep <- data_correlations_plot %>% 
+  select(model, outcomeXexpect, emotion, mean_value) %>% # select only relevant columns
+  pivot_wider(names_from = model, values_from = mean_value) %>% # pivot wider to get one column per model with emotion and level ratings in order
+  select(-c(emotion, outcomeXexpect)) ## remove unused columns (maintained in the pivot to ensure same ordering)
+
+correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>% # make all combinations of model names
+  map_df(~{ # take relevant row in data_prep that corresponds to a pair of names
+    x <- cor_data_prep[[.x[1]]]
+    y <- cor_data_prep[[.x[2]]]
+    test <- cor.test(x, y, method = "spearman") # test with spearman correlation as data is non-normal
+    tibble( # create new tibble with results from test
+      `Model 1` = .x[1],
+      `Model 2` = .x[2],
+      correlation = test$estimate, # get correlation coefficient
+      p_value = test$p.value # get correlation p-value
+    )
+  }) %>% # change str to factor
+  mutate(`Model 1` = as.factor(`Model 1`),
+         `Model 2` = as.factor(`Model 2`),
+         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) # test if p-value is below bonferroni corrected significance level
+
+
+p <- correlation_results %>% # create plot from data
+  distinct(models = paste(pmin(as.character(`Model 1`), as.character(`Model 2`)), 
+                            pmax(as.character(`Model 1`), as.character(`Model 2`)), sep = " vs "), .keep_all = TRUE) %>% # create new names and keep only unique pairings
+  mutate(models = as.factor(models)) %>%
+  ggplot(aes(x = models, y = correlation, fill = factor(significant_binary, levels = c(TRUE, FALSE)))) + # create fill based on significant or not.
+  geom_col(width = 0.7) + # create col/bar diagram
+  coord_flip() + # flip coordinates for horizontal display
+  ylim(-1, 1) + # set correlation limits
+  ylab(expression(paste("Correlation coefficient (", rho, ")", sep = ""))) + # set name with greek letter
+  xlab("") +
+  theme(aspect.ratio = 1/2) +
+  scale_fill_viridis_d(name = "Significant at .0001", # format based on significance 
+                      breaks = c(TRUE, FALSE),
+                      labels = c("Significant", "Not significant")) +
+  labs(title = paste("Correlations between models across all levels (", domain_tmp,")", sep = "")) + 
+  scale_x_discrete(limits = rev(list_order_limits), labels = rev(list_order_names)) + # order from most relevant from the top
+  geom_text(aes(label = paste(round(correlation,2), "        ")), color = "white") # add correlation on plot
+
+p %>% show()
+}
+
+```
+
+### within models and between domains
+
+```{r correlations between domains for each model}
+
+# plotting help
+list_order_names<- c("Basketball vs exam", "Basketball vs pottery", "Basketball vs project", 
+                     "Basketball vs social1", "Basketball vs social2", "Exam vs pottery", "Exam vs project", 
+                     "Exam vs social1", "Exam vs social2", "Pottery vs project", "Pottery vs social1",
+                     "Pottery vs social2", "Project vs Social1", "Project vs Social2", "Social1 vs social2")
+
+list_order_breaks<- c("basketball vs exam", "basketball vs pottery", "basketball vs project", 
+                     "basketball vs social1", "basketball vs social2", "exam vs pottery", "exam vs project", 
+                     "exam vs social1", "exam vs social2", "pottery vs project", "pottery vs social1",
+                     "pottery vs social2", "project vs social1", "project vs social2", "social1 vs social2")
+
+
+# list of correlation models
+list_models <- c("claude-sonnet", "gemini-pro", "gpt-4o", "Human", "llama")
+
+# plotting
+for (model_tmp in list_models){ # for each model
+
+# filter for the right domain
+data_correlations_plot <- d_human_llm_summary %>% 
+  filter(model == model_tmp, # filter for correct model
+         domain != "social_old") %>% # remove any incorrect domains if still there
+  ungroup()
+
+
+# calculate correlations
+
+cor_data_prep <- data_correlations_plot %>% 
+  select(domain, outcomeXexpect, emotion, mean_value) %>% # select only relevant columns
+  pivot_wider(names_from = domain, values_from = mean_value) %>% # pivot wider to get one column per domain with emotion and level ratings in order as row values
+  select(-c(emotion, outcomeXexpect)) # remove unused columns (maintained in the pivot to ensure same ordering)
+
+# calculate significance level
+correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>% # make all combinations of model names
+  map_df(~{ # take relevant row in data_prep that corresponds to a pair of names
+    x <- cor_data_prep[[.x[1]]]
+    y <- cor_data_prep[[.x[2]]]
+    test <- cor.test(x, y, method = "spearman") # test with spearman correlation as data is non-normal
+    tibble( # create new tibble with results from test
+      `Domain 1` = .x[1],
+      `Domain 2` = .x[2],
+      correlation = test$estimate, # get correlation coefficient
+      p_value = test$p.value # get correlation p-value
+    )
+  }) %>%
+  mutate(`Domain 1` = as.factor(`Domain 1`),
+         `Domain 2` = as.factor(`Domain 2`),
+         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE))
+
+# plot
+p <- correlation_results %>%
+  distinct(domains = paste(pmin(as.character(`Domain 1`), as.character(`Domain 2`)), 
+                            pmax(as.character(`Domain 1`), as.character(`Domain 2`)), sep = " vs "), .keep_all = TRUE) %>%  # create new names and keep only unique pairings
+  mutate(domains = as.factor(domains)) %>%
+  ggplot(aes(x = domains, y = correlation, fill = factor(significant_binary, levels = c(TRUE, FALSE)))) + # create factor based on significance for fill
+  geom_col(width = 0.7) + # create bars
+  coord_flip() + # flip coordinates for horizontal display
+  ylim(-1, 1) + 
+  ylab(expression(paste("Correlation coefficient (", rho, ")", sep = ""))) + # add axis name with greek letter 
+  xlab("") +
+  theme(aspect.ratio = 1/2) +
+  scale_fill_viridis_d(name = "Significant at .0001",
+                      breaks = c(TRUE, FALSE),
+                      labels = c("Significant", "Not significant")) +
+  labs(title = paste("Correlations between domains across all levels (", model_tmp,")", sep = "")) + # colour based on significance
+  scale_x_discrete(limits = rev(list_order_breaks), labels = rev(list_order_names)) + # add in order with most relevant from top
+  geom_text(aes(label = paste(round(correlation,2), "        ")), color = "white") # add correlation on plot
+
+p %>% show()
+}
+
+```
+
+## Mean differences
+We calculate the mean differences to inspect how big differences there are in the scores between the models' intensity ratings
+```{r mean differences} 
+
+list_models <- c("claude-sonnet", "gemini-pro", "gpt-4o", "Human", "llama")
+list_outXexpectation <- c("BH", "BL", "GH", "GL") # create list of the outcomes (B = Bad, G = Good, L = Low, H = High)
+
+# set up arrays to save data into
+names <- c()
+domains <- c()
+outXexps <- c()
+mean_abs_diff <- c()
+model_1 <- c()
+model_2 <- c()
+
+# nested loops
+for (model_tmp_1 in list_models){ # for each model
+  for (model_tmp_2 in list_models){ # test each model
+    for (domain_tmp in list_domains){  # and look per domain
+      for (outXexp_tmp in list_outXexpectation){ # for each level interaction
+        name_comb_tmp <- paste(min(model_tmp_1, model_tmp_2),
+                               max(model_tmp_1, model_tmp_2),
+                               sep = " vs. ") # create names of the two models
+        
+        d_model_1_tmp <- d_human_llm_summary %>% # filter data to one model and correct domain, and outcome level interaction
+          filter(model == model_tmp_1,
+                 domain == domain_tmp,
+                 outcomeXexpect == outXexp_tmp)
+        
+        d_model_2_tmp <- d_human_llm_summary %>% # filter the same for the other model
+          filter(model == model_tmp_2,
+                 domain == domain_tmp,
+                 outcomeXexpect == outXexp_tmp)
+        
+        mean_abs_diff_tmp <- mean(abs(d_model_1_tmp$mean_value-d_model_2_tmp$mean_value)) # calculate the mean absolute difference between values
+        # mean_abs_diff_tmp <- mean(d_model_1_tmp$mean_value-d_model_2_tmp$mean_value)
+        
+        names <- c(names, name_comb_tmp) # get combined names
+        model_1 <- c(model_1, min(model_tmp_1, model_tmp_2)) # get first model name (first based on alphabet)
+        model_2 <- c(model_2, max(model_tmp_1, model_tmp_2)) # get second model name (based on alphabet)
+        domains <- c(domains, domain_tmp) # add domain
+        outXexps <- c(outXexps, outXexp_tmp) # add expectation outcome interaction
+        mean_abs_diff <- c(mean_abs_diff, mean_abs_diff_tmp) # add differences
+        
+      }
+    }
+  }
+}
+
+d_mean_abs_diff <- tibble(model_1, model_2, names, domain = domains, outXexps, mean_abs_diff) %>% # create tibble with all the values
+  distinct(.keep_all = True) %>% # get unique model combinations
+  filter(model_1 != model_2) %>% # remove differences within the same model
+  pivot_wider(names_from = domain, values_from = mean_abs_diff) %>% # pivot so we have one column per domain
+  mutate_if(is.numeric, round, 2) # round difference for readability
+  
+
+# We create a plot for each outcome expectation interaction
+d_mean_abs_diff_BH <- d_mean_abs_diff %>% 
+  filter(outXexps == "BH") %>% # filter 
+  select(model_1, model_2, names, "basketball", "exam", "pottery", "project", "social1", "social2") # order data alphabetically
+
+d_mean_abs_diff_BL <- d_mean_abs_diff %>%
+  filter(outXexps == "BL") %>%
+  select(model_1, model_2, names, "basketball", "exam", "pottery", "project", "social1", "social2")
+
+d_mean_abs_diff_GH <- d_mean_abs_diff %>%
+  filter(outXexps == "GH") %>%
+  select(model_1, model_2, names, "basketball", "exam", "pottery", "project", "social1", "social2")
+
+d_mean_abs_diff_GL <- d_mean_abs_diff %>%
+  filter(outXexps == "GL") %>%
+  select(model_1, model_2, names, "basketball", "exam", "pottery", "project", "social1", "social2")
+
+```
+
+We then create plots using the differences
+```{r plot heat maps}
+
+# plot help
+list_order_names<- c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama", 
+                     "Claude-sonnet vs gemini-pro", "Claude-sonnet vs GPT-4o", "Claude-sonnet vs llama", 
+                     "Gemini-pro vs GPT-4o", "Gemini-pro vs llama", "GPT-4o vs llama")
+
+list_order_limits <- c("claude-sonnet vs. Human", "gemini-pro vs. Human", "gpt-4o vs. Human", "Human vs. llama",
+                       "claude-sonnet vs. gemini-pro", "claude-sonnet vs. gpt-4o", "claude-sonnet vs. llama", 
+                       "gemini-pro vs. gpt-4o",  "gemini-pro vs. llama", "gpt-4o vs. llama")
+
+# Good high
+plot_gh <-d_mean_abs_diff_GH %>%
+  pivot_longer(cols = c("basketball", "exam", "pottery", "project", "social1", "social2"),
+               names_to = "domain", values_to = "mean_abs_diff") %>% # pivot longer again for plotting
+  ggplot(data =.,
+         aes(x = domain,
+             y = names,
+             fill = mean_abs_diff)) + # fill with differences
+  geom_tile(color = "white",
+            lwd = 1.5,
+            linejoin = 1) + # create tile plot (or heatmap)
+  coord_fixed() + # fix tile size as squares
+  geom_text(aes(label = mean_abs_diff), color = "black", size = 4) + # add difference as text on each tile
+  scale_fill_gradient(limits = c(0, 2.85), low = "white", high = "red") + # color heatmaps (low to high)
+  theme_minimal() + # theme and names
+  labs(title = "Mean absolute difference (G x H)",
+       y = "",
+       x = "") +
+  theme(title = element_text(size = 12), 
+        axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none") +
+  scale_x_discrete(labels = c("Basketball", "Exam", "Pottery", "Project", "Social1", "Social2")) +
+  scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+
+
+# Bad high - same as above
+plot_bh <- d_mean_abs_diff_BH %>%
+  pivot_longer(cols = c("basketball", "exam", "pottery", "project", "social1", "social2"),
+               names_to = "domain", values_to = "mean_abs_diff") %>%
+  ggplot(data =.,
+         aes(x = domain,
+             y = names,
+             fill = mean_abs_diff)) +
+  geom_tile(color = "white",
+            lwd = 1.5,
+            linejoin = 1) +
+  coord_fixed() +
+  geom_text(aes(label = mean_abs_diff), color = "black", size = 4) +
+  scale_fill_gradient(limits = c(0, 2.85), low = "white", high = "red") + 
+  theme_minimal() +
+  labs(title = "Mean absolute difference (B x H)",
+       y = "",
+       x = "") +
+  theme(title = element_text(size = 12), 
+        axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none") +
+  scale_x_discrete(labels = c("Basketball", "Exam", "Pottery", "Project", "Social1", "Social2")) +
+  scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+  
+
+# Good low
+plot_gl <- d_mean_abs_diff_GL %>%
+  pivot_longer(cols = c("basketball", "exam", "pottery", "project", "social1", "social2"),
+               names_to = "domain", values_to = "mean_abs_diff") %>%
+  ggplot(data =.,
+         aes(x = domain,
+             y = names,
+             fill = mean_abs_diff)) +
+  geom_tile(color = "white",
+            lwd = 1.5,
+            linejoin = 1) +
+  coord_fixed() +
+  geom_text(aes(label = mean_abs_diff), color = "black", size = 4) +
+  scale_fill_gradient(limits = c(0, 2.85), low = "white", high = "red") + 
+  theme_minimal() +
+  labs(title = "Mean absolute difference (G x L)",
+       y = "",
+       x = "") +
+  theme(title = element_text(size = 12), 
+        axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none") +
+  scale_x_discrete(labels = c("Basketball", "Exam", "Pottery", "Project", "Social1", "Social2")) +
+  scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+
+
+# Bad low
+plot_bl <- d_mean_abs_diff_BL %>%
+  pivot_longer(cols = c("basketball", "exam", "pottery", "project", "social1", "social2"),
+               names_to = "domain", values_to = "mean_abs_diff") %>%
+  ggplot(data =.,
+         aes(x = domain,
+             y = names,
+             fill = mean_abs_diff)) +
+  geom_tile(color = "white",
+            lwd = 1.5,
+            linejoin = 1) +
+  coord_fixed() +
+  geom_text(aes(label = mean_abs_diff), color = "black", size = 4) +
+  scale_fill_gradient(limits = c(0, 2.85), low = "white", high = "red") + 
+  theme_minimal() +
+  labs(title = "Mean absolute difference (B x L)",
+       y = "",
+       x = "") +
+  theme(title = element_text(size = 12), 
+        axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none") +
+  scale_x_discrete(labels = c("Basketball", "Exam", "Pottery", "Project", "Social1", "Social2")) +
+  scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+
+```  
+
+## Model errors
+We identify and count all model errors (a lot of this is done manually)
+```{r examine number of errors by each model}
+# We seek to calculate all the errors that each model gives in response to the prompts.
+
+# errors can be: 
+#    *  provide scores outside the requested 0-6
+#    *  prove a reason even when explicitly prompted not to
+#    *  give fewer or more ratings than requested
+# we only count 1 error per prompt
+
+out_of_range_error <- data_all_wide %>%
+  mutate(out_range = if_any(any_of(level_order), ~ .x > 6) * 1, # count if scores are larger than six (multiply to make Bool numeric)
+         nas = if_any(any_of(level_order), ~ is.na(.x)) * 1, # count nas
+         no_back_answer_delim = ifelse(str_detect(response_raw, "</answer>"), 0, 1),# note one of GPT-4o's response is just using <hr> </hr> instead of <answer>
+         no_answer_delim = ifelse(str_detect(response_raw, "<answer>"), 0, 1),# note one llama just starts with <answeriesr>
+         illegal_length = ifelse(
+           (resp_raw_length < 89) | (resp_raw_length == 119) | (resp_raw_length > 214 & resp_raw_length < 265), # these lengths are all manually coded and cover whether or not there are comma and line breaks in results 89-199 and larger numbers are the same but with emotion words
+           0, # if legal length
+           1)) %>%  
+  group_by(model) %>% #  group by model
+  summarise(
+    n = n(), # count total prompts
+    errors_outrange = sum(out_range), # count each error type by summing 1s
+    has_na = sum(nas),
+    wrong_answer_back = sum(no_back_answer_delim),
+    wrong_answer = sum(no_answer_delim),
+    illegal_length = sum(illegal_length)) %>%
+  mutate(errors_outrange = case_match(errors_outrange,
+                                      NA ~ 0, # the NAs are produced by the incomplete cases - these have been checked to not have values outside the range
+                                      .default = errors_outrange)) %>%
+  ungroup()
+
+out_of_range_error # check data
+
+```
+## Prompt differences
+Here we look at each different prompting method
+
+```{r test prompting methods}
+
+# prep data 
+d_prompt_test <- data_all %>%
+  filter(temperature == 0, # ensure the data is same levels as the other analyses
+         `event:done` == "finished",
+         `char2:aware` == "not-aware") %>% # this is similar to main analysis
+  mutate(outcomeXexpect = as.factor(paste(`char1:expectation`, `event:outcome`, sep = "_")), # prep outcome metric
+         outcomeXexpect = case_match(outcomeXexpect, # clean up names
+                                     "high_bad" ~ "BH",
+                                     "high_good" ~ "GH",
+                                     "low_bad" ~ "BL",
+                                     "low_good" ~ "GL"),
+         model = case_match(model, # clean up names
+                                "claude-3-5-sonnet-20240620" ~ "claude-sonnet",
+                                "google/gemini-pro-1.5" ~ "gemini-pro",
+                                "gpt-4o" ~ "gpt-4o",
+                                "meta-llama/llama-3.1-405b-instruct" ~ "llama")) %>%
+  group_by(model, domain, prompt, emotion, outcomeXexpect) %>%
+  summarise(count = n(),
+            mean_value = mean(rating),
+            sd = sd(rating),
+            se = sd/sqrt(count),
+            error_bar_low = mean_value - se,
+            error_bar_high = mean_value + se) %>%
+  ungroup()
+
+
+```
+
+
+```{r individual model prompt testing}
+
+# get different prompt combinations
+prompt_name_order <- c("base vs emotion_word", "base vs reversed_order", "emotion_word vs reversed_order")
+prompt_name_list <- c("'Base' vs 'emotion word'", "'Base' vs 'reversed order'", "'Emotion word' vs 'reversed order'")
+
+list_models <- c("claude-sonnet", "gemini-pro", "gpt-4o", "Human", "llama")
+
+for (model_tmp in list_models){
+  if (model_tmp == "Human") { # skip humans
+    # pass
+  } else{
+  d_prompt_model <- d_prompt_test %>% 
+    filter(model == model_tmp) # get specific model
+
+  d_cor_prompt_prep <- d_prompt_model %>% 
+    select(prompt, domain, outcomeXexpect, emotion, mean_value) %>%
+    pivot_wider(names_from = prompt, values_from = mean_value) %>% # pivot wider to have one column per prompt
+    select(-c(domain, emotion, outcomeXexpect)) # remove other columns maintained over pivot to ensure unique values in order
+  
+  # calculate significance level
+  correlation_results <- combn(names(d_cor_prompt_prep), 2, simplify = FALSE) %>% # create unique combinations
+    map_df(~{ # for each name combination
+      x <- d_cor_prompt_prep[[.x[1]]] # prompt 1
+      y <- d_cor_prompt_prep[[.x[2]]] # prompt 2
+      test <- cor.test(x, y, method = "spearman") # spearman correlation as data non-normal
+      tibble( # create tibble with relavant names
+        `Prompt 1` = .x[1],
+        `Prompt 2` = .x[2],
+        correlation = test$estimate, # get correlation coefficient
+        p_value = test$p.value # get p-value
+      )
+    }) %>%
+    mutate(`Prompt 1` = as.factor(`Prompt 1`),
+           `Prompt 2` = as.factor(`Prompt 2`),
+           significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) # create bool column testing with corrected significance level
+  
+  p <- correlation_results %>%
+    distinct(prompts = paste(pmin(as.character(`Prompt 1`), as.character(`Prompt 2`)), 
+                              pmax(as.character(`Prompt 1`), as.character(`Prompt 2`)), sep = " vs "), .keep_all = TRUE) %>% # create new names with unique pairing
+    mutate(prompts = as.factor(prompts)) %>%
+    ggplot(aes(x = prompts, y = correlation, fill = factor(significant_binary, levels = c(TRUE, FALSE)))) + # fill with significance binary
+    geom_col(width = 0.7) + # create bars
+    coord_flip() +  # flip to horizontal
+    ylim(-1, 1) + # set correlation range
+    ylab(expression(paste("Correlation coefficient (", rho, ")", sep = ""))) + # set name with greek character
+    xlab("") + # themes
+    theme(aspect.ratio = 1/3) +
+    scale_fill_viridis_d(name = "Significant at .0001",
+                        breaks = c(TRUE, FALSE),
+                        labels = c("Significant", "Not significant")) +
+    labs(title = paste("Correlations between prompt types across all levels (", model_tmp,")", sep = "")) + 
+    scale_x_discrete(limit = rev(prompt_name_order), labels = rev(prompt_name_list)) +
+    # scale_x_discrete(labels = rev(prompt_name_list)) + 
+    geom_text(aes(label = paste(round(correlation,2), "        ")), color = "white") # spaces included to force the text unto the bar
+  p %>% show()
+}}
+
+```
+## Across all domains
+### Correlations across all domains and levels - i.e. overall best models
+
+```{r all models complete}
+# minimally commented - identical code structure to previous, so see above for comments
+
+# get plot help
+list_order_names<- c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama", 
+                     "Claude-sonnet vs gemini-pro", "Claude-sonnet vs GPT-4o", "Claude-sonnet vs llama", 
+                     "Gemini-pro vs GPT-4o", "Gemini-pro vs llama", "GPT-4o vs llama")
+
+list_order_limits <- c("claude-sonnet vs. Human", "gemini-pro vs. Human", "gpt-4o vs. Human", "Human vs. llama",
+                       "claude-sonnet vs. gemini-pro", "claude-sonnet vs. gpt-4o", "claude-sonnet vs. llama", 
+                       "gemini-pro vs. gpt-4o",  "gemini-pro vs. llama", "gpt-4o vs. llama")
+
+data_correlations_plot <- d_human_llm_summary %>% 
+  filter(domain != "social_old") %>% # remove incorrect domain if still there
+  ungroup()
+
+
+# calculate correlations
+cor_data_prep <- data_correlations_plot %>% 
+  select(model, domain, outcomeXexpect, emotion, mean_value) %>%
+  pivot_wider(names_from = model, values_from = mean_value) %>%
+  select(-c(domain, emotion, outcomeXexpect))
+
+correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>% 
+  map_df(~{
+    x <- cor_data_prep[[.x[1]]]
+    y <- cor_data_prep[[.x[2]]]
+    test <- cor.test(x, y, method = "spearman")
+    tibble(
+      `Model 1` = .x[1],
+      `Model 2` = .x[2],
+      correlation = test$estimate,
+      p_value = test$p.value
+    )
+  }) %>%
+  mutate(`Model 1` = as.factor(`Model 1`),
+         `Model 2` = as.factor(`Model 2`),
+         significant_binary = ifelse(p_value < 0.0003, TRUE, FALSE))
+
+
+p <- correlation_results %>%
+  distinct(models = paste(pmin(as.character(`Model 1`), as.character(`Model 2`)), 
+                            pmax(as.character(`Model 1`), as.character(`Model 2`)), sep = " vs. "), .keep_all = TRUE) %>% # create new names
+  mutate(models = as.factor(models)) %>%
+  ggplot(aes(x = models, y = correlation, fill = factor(significant_binary, levels = c(TRUE, FALSE)))) + 
+  geom_col(width = 0.7) + 
+  coord_flip() + 
+  ylim(-1, 1) + 
+  ylab(expression(paste("Correlation coefficient (", rho, ")", sep = ""))) + 
+  xlab("") +
+  theme(aspect.ratio = 1/2) +
+  scale_fill_viridis_d(name = "Significant at .0001",
+                      breaks = c(TRUE, FALSE),
+                      labels = c("Significant", "Not significant")) +
+  labs(title = paste("Correlations between models across all levels (all domains)", sep = "")) + 
+  scale_x_discrete(limits = rev(list_order_limits), labels = rev(list_order_names)) +
+  geom_text(aes(label = paste(round(correlation,2), "        ")), color = "white")
+
+p %>% show()
+
+
+
+```
+
+### mean differences across all domains
+
+```{r all models emotion differences}
+
+# minimally commented - identical code structure to previous, so see above for comments
+emotion_differences <- d_human_llm %>%
+  group_by(model, emotion) %>%
+  summarise(mean_value = mean(rating)) %>%
+  ungroup()
+
+wide_emotion_differences <- emotion_differences %>%
+  pivot_wider(names_from = model, values_from = mean_value) %>%
+  mutate(
+         "Human vs claude-sonnet" = (Human-`claude-sonnet`),
+         "Human vs gemini-pro" = (Human-`gemini-pro`),
+         "Human vs GPT-4o" = (Human-`gpt-4o`),
+         "Human vs llama" = (Human-`llama`)) %>%
+  select(c("emotion","Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama"))
+
+plot_emotion_diff <- wide_emotion_differences %>%
+  pivot_longer(cols = c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama"),
+               names_to = "models", values_to = "abs_mean_diff") %>%
+  mutate(emotion = as.factor(emotion),
+         models = as.factor(models)) %>%
+  ggplot(data =.,
+         aes(x = models,
+             y = emotion,
+             fill = abs_mean_diff)) +
+  geom_tile(color = "white",
+            lwd = 1.5,
+            linejoin = 1) +
+  geom_text(aes(label = round(abs_mean_diff, 2)), color = "black", size = 4) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red") + 
+  theme_minimal() +
+  labs(title = "Mean difference per emotion (Human - model)",
+       y = "",
+       x = "") +
+  theme(title = element_text(size = 12), 
+        axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.position = "none") +
+  scale_x_discrete(labels = c("Human - claude-sonnet", "Human - gemini-pro", "Human - GPT-4o", "Human - llama")) 
+  # scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+
+plot_emotion_diff %>% show()
+```
