@@ -5,6 +5,8 @@ date: "2024-10-02"
 output: html_document
 ---
 
+updated 01/04/2026
+
 ## Setup space
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -157,7 +159,7 @@ level_order = c("Interest", "Amusement", "Pride", "Joy", "Pleasure",
     "Sadness", "Guilt", "Regret", "Shame", "Disappointment",
     "Fear", "Disgust", "Contempt", "Hate", "Anger") 
 
-# Choose relevant domain (uncomment for different domain)
+# Choose relevant domain (un-comment for different domain)
 
 # domain_tmp = "basketball"
 # domain_tmp = "exam"
@@ -279,8 +281,25 @@ p %>% show()
 ## Correlations
 Now we want to check correlations between and within models and create plots.
 
+```{r spearman correlation CI}
+# This function is used to calculate the confidence intervals for the 
+# Spearman rank correlation following recommendations from Bonnett and Wright (2000)
 
-### Within domains across between model
+# Function is adapted from https://stats.stackexchange.com/questions/18887/how-to-calculate-a-confidence-interval-for-spearmans-rank-correlation user retodomax - all credit is theirs.
+
+spearman_CI <- function(correlation_coefficient, n = 80, alpha = 0.05){
+  
+  CI <- sort(tanh(atanh(correlation_coefficient) + c(-1,1)*sqrt((1+correlation_coefficient^2/2)/(n-3))*qnorm(p = alpha/2))) # use function from Bonnett and Wright (2000) and sort by size (note c(-1,1) ensures we calculate both lower and upper bound)
+  
+  return(CI) # returns vector CI
+}
+
+
+
+```
+
+
+### Within domains across/between model
 ```{r correlations for each domain across model}
 
 # plotting help
@@ -293,6 +312,8 @@ list_order_limits <- c("claude-sonnet vs Human", "gemini-pro vs Human", "gpt-4o 
                        "gemini-pro vs gpt-4o",  "gemini-pro vs llama", "gpt-4o vs llama")
 
 list_domains <- c("basketball", "exam", "pottery", "project", "social1", "social2")
+
+print_tibble <- tibble(`Model 1` = NULL, `Model 2` = NULL, Domain = NULL, print_friendly = NULL) # initialise print version for latex tables.
 
 # We do calculations and plotting within the same loop
 for (domain_tmp in list_domains){ # for each domain
@@ -318,13 +339,24 @@ correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>% # ma
       `Model 1` = .x[1],
       `Model 2` = .x[2],
       correlation = test$estimate, # get correlation coefficient
-      p_value = test$p.value # get correlation p-value
+      p_value = test$p.value, # get correlation p-value
+      n = length(x) # number of means correlated
     )
   }) %>% # change str to factor
   mutate(`Model 1` = as.factor(`Model 1`),
          `Model 2` = as.factor(`Model 2`),
-         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) # test if p-value is below bonferroni corrected significance level
+         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) %>% # test if p-value is below bonferroni corrected significance level
+  rowwise() %>% 
+  mutate(CI_low = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[1], # use function above to calculate CI - based on Bonnett and Wright (2000)
+         CI_high = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[2],
+         print_friendly = paste(round(correlation, 2), " [", round(CI_low, 2), ", ", round(CI_high, 2), "]", sep = "")) # create a string with correlation coefficient + CI for tables (round to two decimals and add standard formatting) 
 
+ # for tables with all correlations and CIs
+print_tmp <- correlation_results %>% 
+  mutate(Domain = domain_tmp) %>%
+  select(`Model 1`, `Model 2`, Domain, print_friendly)
+
+print_tibble <- bind_rows(print_tibble, print_tmp)
 
 p <- correlation_results %>% # create plot from data
   distinct(models = paste(pmin(as.character(`Model 1`), as.character(`Model 2`)), 
@@ -368,6 +400,8 @@ list_order_breaks<- c("basketball vs exam", "basketball vs pottery", "basketball
 # list of correlation models
 list_models <- c("claude-sonnet", "gemini-pro", "gpt-4o", "Human", "llama")
 
+print_tibble <- tibble(`Domain 1` = NULL, `Domain 2` = NULL, Model = NULL, print_friendly = NULL) # initialise print version for latex tables.
+
 # plotting
 for (model_tmp in list_models){ # for each model
 
@@ -395,12 +429,24 @@ correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>% # ma
       `Domain 1` = .x[1],
       `Domain 2` = .x[2],
       correlation = test$estimate, # get correlation coefficient
-      p_value = test$p.value # get correlation p-value
+      p_value = test$p.value, # get correlation p-value
+      n = length(x) # number of means correlated
     )
   }) %>%
   mutate(`Domain 1` = as.factor(`Domain 1`),
          `Domain 2` = as.factor(`Domain 2`),
-         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE))
+         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE))  %>% # test if p-value is below bonferroni corrected significance level
+  rowwise() %>% 
+  mutate(CI_low = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[1], # use function above to calculate CI - based on Bonnett and Wright (2000)
+         CI_high = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[2],
+         print_friendly = paste(round(correlation, 2), " [", round(CI_low, 2), ", ", round(CI_high, 2), "]", sep = "")) # create a string with correlation coefficient + CI for tables (round to two decimals and add standard formatting) )
+
+# for tables with all correlations and CIs
+print_tmp <- correlation_results %>% 
+  mutate(Model = model_tmp) %>%
+  select(`Domain 1`, `Domain 2`, Model, print_friendly)
+
+print_tibble <- bind_rows(print_tibble, print_tmp)
 
 # plot
 p <- correlation_results %>%
@@ -696,6 +742,8 @@ prompt_name_list <- c("'Base' vs 'emotion word'", "'Base' vs 'reversed order'", 
 
 list_models <- c("claude-sonnet", "gemini-pro", "gpt-4o", "Human", "llama")
 
+print_tibble <- tibble(`Prompt 1` = NULL, `Prompt 2` = NULL, Model = NULL, print_friendly = NULL) # initialise print version for latex tables.
+
 for (model_tmp in list_models){
   if (model_tmp == "Human") { # skip humans
     # pass
@@ -718,12 +766,24 @@ for (model_tmp in list_models){
         `Prompt 1` = .x[1],
         `Prompt 2` = .x[2],
         correlation = test$estimate, # get correlation coefficient
-        p_value = test$p.value # get p-value
+        p_value = test$p.value, # get p-value
+        n = length(x) # number of means correlated
       )
     }) %>%
     mutate(`Prompt 1` = as.factor(`Prompt 1`),
            `Prompt 2` = as.factor(`Prompt 2`),
-           significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) # create bool column testing with corrected significance level
+           significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) %>%# create bool column testing with corrected significance level
+    rowwise() %>% 
+    mutate(CI_low = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[1], # use function above to calculate CI - based on Bonnett and Wright (2000)
+           CI_high = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[2],
+         print_friendly = paste(round(correlation, 2), " [", round(CI_low, 2), ", ", round(CI_high, 2), "]", sep = "")) # create a string with correlation coefficient + CI for tables (round to two decimals and add standard formatting) )
+
+# for tables with all correlations and CIs
+print_tmp <- correlation_results %>% 
+  mutate(Model = model_tmp) %>%
+  select(`Prompt 1`, `Prompt 2`, Model, print_friendly)
+
+print_tibble <- bind_rows(print_tibble, print_tmp)
   
   p <- correlation_results %>%
     distinct(prompts = paste(pmin(as.character(`Prompt 1`), as.character(`Prompt 2`)), 
@@ -782,12 +842,16 @@ correlation_results <- combn(names(cor_data_prep), 2, simplify = FALSE) %>%
       `Model 1` = .x[1],
       `Model 2` = .x[2],
       correlation = test$estimate,
-      p_value = test$p.value
+      p_value = test$p.value,
+      n = length(x)
     )
   }) %>%
   mutate(`Model 1` = as.factor(`Model 1`),
          `Model 2` = as.factor(`Model 2`),
-         significant_binary = ifelse(p_value < 0.0003, TRUE, FALSE))
+         significant_binary = ifelse(p_value < 0.0001, TRUE, FALSE)) %>%
+  rowwise() %>% 
+  mutate(CI_low = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[1], # use function above to calculate CI - based on Bonnett and Wright (2000)
+         CI_high = spearman_CI(correlation_coefficient = correlation, n = n, alpha = 0.0001)[2])
 
 
 p <- correlation_results %>%
@@ -835,17 +899,17 @@ wide_emotion_differences <- emotion_differences %>%
 
 plot_emotion_diff <- wide_emotion_differences %>%
   pivot_longer(cols = c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama"),
-               names_to = "models", values_to = "abs_mean_diff") %>%
+               names_to = "models", values_to = "mean_diff") %>%
   mutate(emotion = as.factor(emotion),
          models = as.factor(models)) %>%
   ggplot(data =.,
          aes(x = models,
              y = emotion,
-             fill = abs_mean_diff)) +
+             fill = mean_diff)) +
   geom_tile(color = "white",
             lwd = 1.5,
             linejoin = 1) +
-  geom_text(aes(label = round(abs_mean_diff, 2)), color = "black", size = 4) +
+  geom_text(aes(label = round(mean_diff, 2)), color = "black", size = 4) +
   scale_fill_gradient2(low = "blue", mid = "white", high = "red") + 
   theme_minimal() +
   labs(title = "Mean difference per emotion (Human - model)",
@@ -855,8 +919,18 @@ plot_emotion_diff <- wide_emotion_differences %>%
         axis.text.x = element_text(size = 12,angle = 40, hjust = 1),
         axis.text.y = element_text(size = 12),
         legend.position = "none") +
-  scale_x_discrete(labels = c("Human - claude-sonnet", "Human - gemini-pro", "Human - GPT-4o", "Human - llama")) 
-  # scale_y_discrete(limits = rev(list_order_limits), labels = rev(list_order_names))
+  scale_x_discrete(labels = c("Human - claude-sonnet", "Human - gemini-pro", "Human - GPT-4o", "Human - llama")) +
+  scale_y_discrete(limits = rev(emotion_order), labels = rev(emotion_order))
 
 plot_emotion_diff %>% show()
+
+differences_total <- wide_emotion_differences %>%
+  pivot_longer(cols = c("Human vs claude-sonnet", "Human vs gemini-pro", "Human vs GPT-4o", "Human vs llama"),
+               names_to = "models", values_to = "mean_diff") %>%
+  mutate(emotion = as.factor(emotion),
+         models = as.factor(models)) %>%
+  group_by(models) %>%
+  summarise(total_diff = sum(mean_diff))
+
+
 ```
